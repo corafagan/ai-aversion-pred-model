@@ -84,6 +84,7 @@ The goal was to build interpretable classification models to predict AI aversion
 - ai-aversion-pred-mod.Rmd # Main analysis and model code 
 - ai-aversion-pred-mod.html # knitted .html file
 - oxis2019ukda.dta # Raw survey data (not included in repo)
+- ai-aversion-pred-mod_files # folderes of figures produced in the analysis
 - README.md # Project documentation
 
 ---
