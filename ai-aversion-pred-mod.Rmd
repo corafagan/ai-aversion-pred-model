@@ -1,0 +1,784 @@
+---
+title: "AI Aversion Predictive Model"
+output: html_document
+date: "2025-06-29"
+---
+
+```{r setup, include=FALSE} 
+# this chunk contains code that sets global options for the entire .Rmd. 
+# we use include=FALSE to suppress it from the top of the document, but it will still appear in the appendix. 
+
+knitr::opts_chunk$set(echo = FALSE) # actually set the global chunk options. 
+# we set echo=FALSE to suppress code such that it by default does not appear throughout the document. 
+# note: this is different from .Rmd default
+```
+
+## Prediction AI Aversion from 2019 Oxford Internet Survey 
+
+It is not feasible to identify AI-averse individuals, without directly asking about their attitudes to this technology based on the 2019 Oxford Internet Survey.
+
+The survey dataset includes a variable, `agai`, representing respondents’ agreement with the statement:
+
+*Artificial Intelligence will bring overall positive benefits for society.*
+
+Responses follow a Likert Scale (1 = Strongly Disagree, 5 = Strongly Agree). Those who selected 1 or 2 are classified as AI Averse, while those who chose 3, 4, 5, or Don’t Know (NA) are Not Averse. The variable was re-coded as binary, with the positive class indicating AI aversion. Other variables are treated as predictors.
+
+Since many predictors use a Likert Scale and have large numbers of missing values, linear models (e.g., LASSO, Ridge) are unsuitable. Additionally, with this data-structure KNN clustering is computationally inefficient. Instead, CART models were chosen because they can handle both categorical and continuous variables, as well as missing values without imputation. Missing values are not random (e.g., “Don’t Know”, “Refused”), so they remain in the dataset. However, they are excluded from the model to avoid assigning an artificial order to them.
+
+Variables that only pertain to the survey methodology have been excluded from my model, as they do not provide information about the preferences of respondents.
+
+```{r ex_2_setup, message = FALSE, warning = FALSE}
+# install and load the haven package if necessary
+if (!requireNamespace("haven", quietly = TRUE)) install.packages("haven")
+if (!requireNamespace("glmnet", quietly = TRUE)) install.packages("glmnet")
+if (!requireNamespace("tidyverse", quietly = TRUE)) install.packages("tidyverse")
+if (!requireNamespace("rpart", quietly = TRUE)) install.packages("rpart")
+if (!requireNamespace("rpart.plot", quietly = TRUE)) install.packages("rpart.plot")
+if (!requireNamespace("caret", quietly = TRUE)) install.packages("caret")
+if (!requireNamespace("pROC", quietly = TRUE)) install.packages("pROC")
+if (!requireNamespace("knitr", quietly = TRUE)) {install.packages("knitr")}
+if (!requireNamespace("flextable", quietly = TRUE)) {install.packages("flextable")}
+
+# Load the packages
+library(knitr)
+library(kableExtra)
+library(haven)
+library(glmnet)
+library(tidyverse)
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(pROC)
+library(flextable)
+```
+
+```{r read_data}
+# Load the data
+internet_data <- read_dta("/Users/Cora/Documents/MY474/UKDA-9146-stata/stata/stata14/oxis2019ukda.dta")
+```
+
+```{r clean_data}
+
+# Convert internet_data to a dataframe in the format in which it was originally loaded into workspace
+internet_df <- as.data.frame(internet_data)
+
+# now using the original, haven labelled data, mutate across columns renaming cols their labels 
+internet_data <- internet_data %>%
+  mutate(across(where(is.labelled), ~ as_factor(.)))
+
+#  Function to check if "No" exists in the values of the column, these are present in the binary cols
+check_no_in_column <- function(col) {
+  if ("No" %in% col) {
+    return(TRUE)
+  }
+  return(FALSE)
+}
+
+# Loop through each column in internet_data and check for "No"
+binary_search <- names(internet_data)[sapply(internet_data, function(col) {
+  # Convert to character if it's a labeled numeric vector
+  col_vals <- if (inherits(col, "labelled")) {
+    labels <- attr(col, "labels")
+    factor(col, levels = labels)
+  } else {
+    col
+  }
+  
+  # Check if "No" is in the column values
+  check_no_in_column(col_vals)
+})]
+
+# Loop through the data-frame converted data and look for where all NA cols are either only 0 or 1 
+binary_cols <- names(internet_df)[sapply(internet_df, function(col) {
+  if (is.numeric(col)) {  
+    all(na.omit(col) %in% c(0, 1))  # Only check non-NA values
+  } else {
+    FALSE  # Exclude non-numeric columns
+  }
+})]
+
+
+# find unordered factor cols
+factor_cols <- c("s_wheng", "acornc", "acorng", "u_fund", "u_lerloc", "p_party", "labfor","marstat", "urbrur", "region", "u_lerloc", "u_gofir", "n_reimp", "e_reimpu", "e_reimps", "e_renotuse", "cs_bank", "cs_form", "cs_vid", "cs_pjt", "cs_heal", "eth4")
+
+# find cols used for survey methods to remove
+survey_cols <- c("doi", "intid", "oap", "agew", "acornt", "visits", "oadist", "serial", "weight")
+
+# numeric cols 
+cont_cols <- c("accyr", "nbad", "ngovf", "ngovfo", "ngovo", "ngovoo","nhh", "nicts", "nindev", "nmob", "popul5", "u_ncom", "u_nent", "u_nlea","u_nnfo", "u_npdn", "u_nsns", "u_nsnsact", "yonline", "lernsc", "lonely", "p_ef", "popul", "stpriv", "techatt", "u_ncom", "age","e_stopyr","e_usedyr", "usedyr", "yrborn", "adulthh", "imds")
+
+# now the rest should be ordered factors
+selected_cols <- c(binary_cols, factor_cols, survey_cols, cont_cols, binary_search)
+orderd_cols <- setdiff(names(internet_df), selected_cols)
+
+# convert ordered cols to ordered factor variables
+internet_df[orderd_cols] <- lapply(internet_df[orderd_cols], 
+                                        function(x) factor(x, ordered = TRUE))
+
+# convert numeric cols to numeric
+for (col in cont_cols) {
+  if (col %in% names(internet_df)) {
+    internet_df[[col]] <- as.numeric(internet_df[[col]])
+  }
+}
+
+# convert unordered factor columns to factors
+for (col in factor_cols) {
+  if (col %in% names(internet_df)) {
+    internet_df[[col]] <- as.factor(internet_df[[col]])
+  }
+}
+
+# convert binary cols to factors 
+for (col in binary_cols) {
+  if (col %in% colnames(internet_df)) {
+    internet_df[[col]] <- as.factor(internet_df[[col]])
+  }
+}
+
+# convert binary columns to factors, ensuring all expected levels are present
+for (col in binary_search) {
+  if (col %in% colnames(internet_df)) {
+    internet_df[[col]] <- as.factor(internet_df[[col]])
+  }
+}
+
+# remove survey columns
+internet_df <- internet_df[ , !(names(internet_df) %in% survey_cols)]
+```
+
+In the dataset there are significantly more instances of the negative class, than the positive class. To make sure that there are enough instances of the positive class to validate the model, I used stratified sampling, rather than random sampling.
+
+```{r binary_response}
+
+# Recode agai: 1 & 2 -> 1, 3, 4, 5, NA -> 0
+binary_df <- internet_df
+binary_df$agai <- ifelse(is.na(binary_df$agai) | binary_df$agai %in% c(3, 4, 5), 0, 1)
+binary_df$agai <- as.factor(binary_df$agai)  # Convert to factor
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Perform stratified sampling to maintain class balance
+train_idx <- createDataPartition(binary_df$agai, p = 0.6, list = FALSE)  # 60% Training
+train_data <- binary_df[train_idx, ]
+remaining_data <- binary_df[-train_idx, ]
+
+# Split remaining 40% into validation (20%) and test (20%) - stratified
+valid_idx <- createDataPartition(remaining_data$agai, p = 0.5, list = FALSE)  # 50% of remaining
+valid_data <- remaining_data[valid_idx, ]
+test_data <- remaining_data[-valid_idx, ]
+
+# Separate response variable
+train_X <- train_data
+valid_X <- valid_data
+test_X <- test_data
+
+train_y <- train_X$agai
+valid_y <- valid_X$agai
+test_y <- test_X$agai
+
+# Remove response variable from predictor datasets
+train_X$agai <- NULL
+valid_X$agai <- NULL
+test_X$agai <- NULL
+```
+
+```{r calc_metrics_function}
+
+# Define function to evaluate model performance later
+calc_metrics <- function(conf_matrix) {
+  num_classes <- nrow(conf_matrix)  # Number of classes
+  metrics_df <- data.frame(Precision = numeric(num_classes),
+                           Recall = numeric(num_classes),
+                           F1_Score = numeric(num_classes),
+                           row.names = rownames(conf_matrix))  # Maintain class labels
+  
+  for (i in 1:num_classes) {
+    tp <- conf_matrix[i, i]  # True Positives
+    fp <- sum(conf_matrix[i, ]) - tp  # False Positives
+    fn <- sum(conf_matrix[, i]) - tp  # False Negatives
+    tn <- sum(conf_matrix) - tp - fp - fn  # True Negatives
+    
+    precision <- ifelse(tp + fp > 0, tp / (tp + fp), 0)
+    recall <- ifelse(tp + fn > 0, tp / (tp + fn), 0)
+    f1_score <- ifelse((precision + recall) > 0, 2 * (precision * recall) / (precision + recall), 0)
+    
+    # Store results in dataframe
+    metrics_df$Precision[i] <- precision
+    metrics_df$Recall[i] <- recall
+    metrics_df$F1_Score[i] <- f1_score
+  }
+  
+  return(metrics_df)
+}
+```
+
+First, I trained a CART model to understand its baseline performance. Due to the class imbalance in the dataset, Table 1 shows that the model is able to identify people who are not AI averse (negative class). However, it performs significantly worse on the positive class (AI aversion).
+
+```{r basic tree}
+
+# Basic Binary Classification Tree
+tree <- rpart(train_y ~ ., 
+                    data = train_X, 
+                    method = "class")
+
+# Define a function to find the complexity parameter (cp) with the best xerror 
+find_best_cp <- function(tree_model) {
+  
+  # Extract cp table
+  cp_table <- tree_model$cptable
+  
+  # Ensure there's at least one split
+  valid_splits <- cp_table[cp_table[, "nsplit"] > 0, , drop = FALSE]
+  
+  # Find the index where xerror is minimum AND there's at least one split
+  best_cp_index <- which.min(valid_splits[, "xerror"])  # Find min xerror among valid splits
+  best_cp <- valid_splits[best_cp_index, "CP"]
+  
+  return(best_cp)
+}
+
+best_cp <- find_best_cp(tree)
+
+metrics <- calc_metrics(table(Predicted = predict(tree, valid_X, type = "class"), Actual = valid_y))
+
+# Retrain the Decision Tree with the best cp
+tree_optimized <- rpart(train_y ~ ., 
+                           data = train_X, 
+                           method = "class", 
+                           control = rpart.control(cp = best_cp))
+
+# Predict on validation data
+bi_tree_pred <- predict(tree_optimized, valid_X, type = "class")
+
+# Compute confusion matrix & metrics
+bi_conf_matrix <- table(Predicted = bi_tree_pred, Actual = valid_y)
+metrics_cp <- calc_metrics(bi_conf_matrix)
+
+# Use flextable to format the table
+ft_1 <- flextable(metrics_cp) %>%
+  set_caption("Table 1: Model Performance Metrics on Basic CART") %>%
+  theme_vanilla() %>%  # Apply a clean table style
+  autofit()  # Adjust column widths automatically
+
+# Print the table
+ft_1
+```
+
+```{r overfitting}
+
+# Check how this compares to its performance on the training data to check for overfitting 
+train_pred <- predict(tree, train_X, type = "class")
+train_pred_optimized <- predict(tree_optimized, train_X, type = "class")
+conf_matrix_train <- table(Predicted = train_pred, Actual = train_y)
+conf_matrix_train_optimized <- table(Predicted = train_pred_optimized, Actual = train_y)
+
+# Calculate metrics to evaluate model performance
+train_metrics <- data.frame(Class = levels(train_y), Precision = NA, Recall = NA, F1_Score = NA)
+train_metrics_optimized <- data.frame(Class = levels(train_y), Precision = NA, Recall = NA, F1_Score = NA)
+train_metrics <- calc_metrics(conf_matrix_train)
+train_metrics_optimized <- calc_metrics(conf_matrix_train_optimized)
+```
+
+To address class imbalance, various resampling techniques were tested (e.g., class weighting, upsampling, downsampling, bootstrap sampling). While these methods improved recall, they also led to more false positives, keeping precision low.
+
+The model that performed the best with a baseline complexity parameter was fine-tuned at the end to minimize overfitting and maximize model performance.
+ 
+```{r class_weights}
+
+# CLASS WEIGHTS BASED ON CLASS PREVALENCE
+
+# Due to the class imbalance, using class weights might help rebalance the classes
+# Compute class weights
+class_weights <- table(train_y)
+class_weights <- sqrt(sum(class_weights) / class_weights)
+class_weights <- class_weights / sum(class_weights) # Normalize to sum to 1
+
+# Train Decision Tree with Class Weights
+tree_class_weights <- rpart(train_y ~ ., 
+                 data = train_X, 
+                 method = "class", 
+                 parms = list(prior = class_weights),
+                 control = rpart.control(.01)
+)
+
+cw_best_cp <- find_best_cp(tree_class_weights)
+
+# Retrain with optimized cp
+tree_class_weights <- rpart(train_y ~ ., 
+                 data = train_X, 
+                 method = "class", 
+                 parms = list(prior = class_weights),
+                 control = rpart.control(cp = cw_best_cp)
+)
+
+# weighted predictions
+bi_tree_cw_pred <- predict(tree_class_weights, valid_X, type = "class")
+
+# calculate weighted accuracy
+bi_conf_matrix <- table(Predicted = bi_tree_cw_pred, Actual = valid_y)
+metrics_class_weights <- calc_metrics(bi_conf_matrix)
+```
+
+```{r majority_vote}
+
+# Define function to find the majority class each row was assigned - will be used for bootstrap models
+majority_vote <- function(models, test_data) {
+  # Get predictions from all models
+  predictions <- sapply(models, function(model) predict(model, test_data, type = "class"))
+  
+  # Determine the majority vote for each observation
+  final_preds <- apply(predictions, 1, function(x) {
+    mode_value <- names(sort(table(x), decreasing = TRUE))[1]  # Get most frequent class
+    return(as.numeric(mode_value))  # Convert to numeric
+  })
+  
+  # Convert to factor with levels 0 and 1
+  return(factor(final_preds, levels = c(0, 1)))
+}
+
+```
+
+```{r boostrap_cv_c1up}
+
+# BOOTSTRAP CLASS WEIGHTING WITH CROSS-VALIDATION - UPSAMPLING CLASS 1 (MINORITY CLASS)
+
+bootstrap_balance_c1up_cp <- function(data, response_var, num_models = 10) {
+  
+  models <- list()  # Store multiple decision trees
+  best_cp_values <- numeric(num_models)  # Store best cp for each iteration
+  
+  for (i in 1:num_models) {
+    
+    # Bootstrap sample (with replacement)
+    boot_sample <- data[sample(1:nrow(data), replace = TRUE), ]
+
+    # Separate majority (Class 0) and minority (Class 1)
+    class_0 <- boot_sample[boot_sample[[response_var]] == 0, ]
+    class_1 <- boot_sample[boot_sample[[response_var]] == 1, ]
+    
+    # Oversample Class 1 to match Class 0 count (with replacement)
+    class_1_oversampled <- class_1[sample(1:nrow(class_1), size = nrow(class_0), replace = TRUE), ]
+    
+    # Combine balanced classes
+    balanced_sample <- rbind(class_0, class_1_oversampled)
+    
+    # Train CART model (initially with low cp)
+    initial_model <- rpart(as.formula(paste(response_var, "~ .")), 
+                           data = balanced_sample, 
+                           method = "class",
+                           control = rpart.control(cp = 0.001),
+                           model = TRUE)  # Start with a small cp
+    
+    # Find the best cp using previously defined find_best_cp() function
+    best_cp <- find_best_cp(initial_model)
+    best_cp_values[i] <- best_cp  # Store cp
+    
+    # Train the final model with best cp
+    final_model <- rpart(as.formula(paste(response_var, "~ .")), 
+                         data = balanced_sample, 
+                         method = "class",
+                         control = rpart.control(cp = best_cp),
+                         model = TRUE)
+    
+    models[[i]] <- final_model
+  }
+  
+  return(list(models = models, best_cp = best_cp_values))
+}
+
+train_X$agai <- train_y
+
+# Run bootstrap cross-validation with automatic cp selection
+boot_models_cp_c1up <- bootstrap_balance_c1up_cp(train_X, "agai", num_models = 20)
+
+# Compute the average best cp value across models
+best_cp_final_c1up <- mean(boot_models_cp_c1up$best_cp, na.rm = TRUE)
+
+# Train final model with the average best cp
+cv_boot_models_c1up <- lapply(boot_models_cp_c1up$models, function(model) {
+  rpart(as.formula(paste("agai ~ .")), 
+        data = train_X, 
+        method = "class",
+        control = rpart.control(cp = best_cp_final_c1up))
+})
+
+# predict on validation data
+cv_predictions_c1up <- majority_vote(cv_boot_models_c1up, valid_X)
+
+# Evaluate model performance
+cv_conf_matrix_c1up <- table(Predicted = cv_predictions_c1up, Actual = valid_y)
+metrics_bootstrap_c1up_cv <- calc_metrics(cv_conf_matrix_c1up)
+```
+
+```{r boorstrap_cv_c0dwn}
+
+# BOOTSTRAP WITH CROSS-VALIDATION - DOWNSAMPLING CLASS 0 (MAJORITY CLASS)
+
+bootstrap_balance_c0dwn_cp <- function(data, response_var, num_models = 10) {
+  
+  models <- list()  # Store multiple decision trees
+  best_cp_values <- numeric(num_models)  # Store best cp for each iteration
+  
+  for (i in 1:num_models) {
+    
+    # Bootstrap sample (with replacement)
+    boot_sample <- data[sample(1:nrow(data), replace = TRUE), ]
+
+    # Separate majority (Class 0) and minority (Class 1)
+    class_0 <- boot_sample[boot_sample[[response_var]] == 0, ]
+    class_1 <- boot_sample[boot_sample[[response_var]] == 1, ]
+    
+    # Downsample Class 0 to match Class 1 count (instead of oversampling Class 1)
+    class_0_downsampled <- class_0[sample(1:nrow(class_0), size = nrow(class_1), replace = FALSE), ]
+    
+    # Combine balanced classes
+    balanced_sample <- rbind(class_0_downsampled, class_1)
+    
+    # Train CART model (initially with low cp)
+    initial_model <- rpart(as.formula(paste(response_var, "~ .")), 
+                           data = balanced_sample, 
+                           method = "class",
+                           control = rpart.control(cp = 0.001),
+                           model = TRUE)  # Start with a small cp
+    
+    # Find the best cp using find_best_cp()
+    best_cp <- find_best_cp(initial_model)
+    best_cp_values[i] <- best_cp  # Store cp
+    
+    # Train the final model with best cp
+    final_model <- rpart(as.formula(paste(response_var, "~ .")), 
+                         data = balanced_sample, 
+                         method = "class",
+                         control = rpart.control(cp = best_cp),
+                         model = TRUE)
+    
+    models[[i]] <- final_model
+  }
+  
+  return(list(models = models, best_cp = best_cp_values))
+}
+
+train_X$agai <- train_y  # Ensure response variable is inside training data
+
+# Run bootstrap cross-validation with automatic cp selection
+boot_models_cp_c0dwn <- bootstrap_balance_c0dwn_cp(train_X, "agai", num_models = 20)
+
+# Compute the average best cp value across k models
+best_cp_final_c0dwn <- mean(boot_models_cp_c0dwn$best_cp, na.rm = TRUE)  # Ignore NA values
+
+# Train final model with the average best cp
+cv_boot_models_c0dwn <- lapply(boot_models_cp_c0dwn$models, function(model) {
+  rpart(as.formula(paste("agai ~ .")), 
+        data = train_X, 
+        method = "class",
+        control = rpart.control(cp = best_cp_final_c0dwn))
+})
+
+# Predict on validation data using majority vote from bootstrapped models
+cv_predictions_c0dwn <- majority_vote(cv_boot_models_c0dwn, valid_X)
+
+# Evaluate model performance
+cv_conf_matrix_c0dwn <- table(Predicted = cv_predictions_c0dwn, Actual = valid_y)
+
+# Compute classification metrics
+metrics_bootstrap_c0dwn_cv <- calc_metrics(cv_conf_matrix_c0dwn)
+```
+```{r bootstrap_predprob, warning=FALSE}
+
+# BOOTSTRAP CLASS WEIGHTING WITH PREDICTED PROBABILITIES
+
+# Rather than predicting into a "class" what if we use predicted probabilities, and adjust our threshold, so that we are better able to predict AI aversion 
+
+# Function to get probability predictions
+average_probabilities <- function(models, test_data) {
+  predictions <- matrix(NA, nrow = nrow(test_data), ncol = length(models))
+  
+  for (i in 1:length(models)) {
+    prob_predictions <- predict(models[[i]], test_data, type = "prob")[, 2]  # Probability of Class 1
+    predictions[, i] <- prob_predictions
+  }
+  
+  # Compute the average probability across all models
+  avg_prob <- rowMeans(predictions)
+  
+  return(avg_prob)
+}
+
+# Remove response variable from test data before predicting
+valid_X$agai <- NULL
+
+cv_probabilities_c1up <- average_probabilities(cv_boot_models_c1up, valid_X)
+cv_probabilities_c0dwn <- average_probabilities(cv_boot_models_c0dwn, valid_X)
+
+cv_predictions_c1up_prob <- as.factor(ifelse(cv_probabilities_c1up >= .5, 1, 0))
+cv_predictions_c0dwn_prob <- as.factor(ifelse(cv_probabilities_c0dwn >= .5, 1, 0))
+
+# Compute ROC curve (use probabilities instead of class predictions)
+roc_curve_c1up_cv_prob <- suppressMessages(roc(valid_y, cv_probabilities_c1up))  # Use probabilities, not predictions
+roc_curve_c0dwn_cv_prob <- suppressMessages(roc(valid_y, cv_probabilities_c0dwn)) 
+
+# Compute AUC values
+auc_c1up_cv <- auc(roc_curve_c1up_cv_prob)
+auc_c0dwn_cv <- auc(roc_curve_c0dwn_cv_prob)
+
+# Find the best threshold
+best_threshold_c1up_cv <- coords(roc_curve_c1up_cv_prob, "best", ret = "threshold")
+best_threshold_c0dwn_cv <- coords(roc_curve_c0dwn_cv_prob, "best", ret = "threshold")
+
+# Re-run with best threshold
+final_predictions_c1up_cv <- factor(ifelse(cv_probabilities_c1up >= as.numeric(best_threshold_c1up_cv), 1, 0), levels = c(0, 1))
+final_predictions_c0dwn_cv <- factor(ifelse(cv_probabilities_c0dwn >= as.numeric(best_threshold_c0dwn_cv), 1, 0), levels = c(0, 1))
+
+# Evaluate model performance
+cv_conf_matrix_c1up <- table(Predicted = final_predictions_c1up_cv, Actual = valid_y)
+cv_conf_matrix_c0dwn <- table(Predicted = final_predictions_c0dwn_cv, Actual = valid_y)
+
+# Calculate performance metrics
+metrics_bootstrap_c1up_cv <- calc_metrics(cv_conf_matrix_c1up)
+metrics_bootstrap_c0dwn_cv <- calc_metrics(cv_conf_matrix_c0dwn)
+```
+
+```{r bootstrap_overfitting}
+
+# Check for overfitting with the bootstrap models - class predictions
+final_predictions_train_c1up <- majority_vote(cv_boot_models_c1up, train_X)
+final_predictions_train_c0dwn <- majority_vote(cv_boot_models_c0dwn, train_X)
+
+# check for overfitting with bootstrap models - predicted probabilities
+final_probabilities_train_c1up <- average_probabilities(cv_boot_models_c1up, train_X)
+final_predictions_train_prob_c1up <- factor(ifelse(final_probabilities_train_c1up >= as.numeric(best_threshold_c1up_cv), 1, 0), levels = c(0, 1))
+
+final_probabilities_train_c0dwn <- average_probabilities(cv_boot_models_c0dwn, train_X)
+final_predictions_train_prob_c0dwn <- factor(ifelse(final_probabilities_train_c0dwn >= as.numeric(best_threshold_c0dwn_cv), 1, 0), levels = c(0, 1))
+```
+
+```{r downsample}
+
+# CLASSIC DOWNSAMPLING
+
+# Combine predictors and response before downsampling
+train_X$agai <- train_y  # Add the response variable to the dataset
+
+# Down-sample the majority class
+balanced_train <- downSample(x = train_X[, -which(names(train_X) == "agai")], 
+                             y = train_X$agai, 
+                             yname = "agai")
+
+
+# Train Decision Tree on balanced dataset
+tree_downsample <- rpart(agai ~ ., 
+                          data = balanced_train, 
+                          method = "class", 
+                          control = rpart.control(cp = 0.01))
+
+# Predict on validation data
+bi_tree_pred_balanced <- predict(tree_downsample, valid_X, type = "class")
+bi_tree_pred_balanced_prob <- predict(tree_downsample, valid_X, type = "prob")[, 2]
+
+# Evaluate model performance
+bi_conf_matrix_balanced <- table(Predicted = bi_tree_pred_balanced, Actual = valid_y)
+
+# Calculate metrics to evaluate model performance
+metrics_downsample <- data.frame(Class = levels(valid_y), Precision = NA, Recall = NA, F1_Score = NA)
+metrics_downsample <- calc_metrics(bi_conf_matrix_balanced)
+```
+
+```{r upsample}
+
+# CLASSIC UPSAMPLING
+
+# Combine predictors and response before upsampling
+train_X$agai <- train_y  # Add the response variable to the dataset
+
+# Up-sample the minority class (Class 1)
+balanced_train <- upSample(x = train_X[, -which(names(train_X) == "agai")], 
+                           y = train_X$agai, 
+                           yname = "agai")
+
+# Train Decision Tree on upsampled dataset
+tree_upsample <- rpart(agai ~ ., 
+                        data = balanced_train, 
+                        method = "class", 
+                        control = rpart.control(cp = 0.01))
+
+# Predict on validation data
+bi_tree_pred_balanced <- predict(tree_upsample, valid_X, type = "class")
+bi_tree_pred_balanced_prob <- predict(tree_upsample, valid_X, type = "prob")[, 2]
+
+# Evaluate model performance
+bi_conf_matrix_balanced <- table(Predicted = bi_tree_pred_balanced, Actual = valid_y)
+conf_matrix_results <- confusionMatrix(bi_tree_pred_balanced, valid_y)
+
+# Calculate metrics to evaluate model performance
+metrics_upsample <- data.frame(Class = levels(valid_y), Precision = NA, Recall = NA, F1_Score = NA)
+metrics_upsample <- calc_metrics(bi_conf_matrix_balanced)
+```
+
+```{r manual_class_weights }
+# MANUAL CLASS WEIGHTING
+
+# Class weighting
+# Define class weights (higher for Class 1)
+class_weights <- list("0" = 1, "1" = 3)  # Give Class 1 more importance
+class_weights <- c(0.25, 0.75)
+
+# Train a Decision Tree with class weighting
+model_weighted <- rpart(as.formula("agai ~ ."),
+                         data = train_X,
+                         method = "class",
+                         control = rpart.control(cp = 0.01),
+                         parms = list(prior = class_weights))
+
+# Predict on validation data
+weighted_predictions <- predict(model_weighted, valid_X, type = "class")
+
+# Compute confusion matrix & metrics
+weighted_conf_matrix <- table(Predicted = weighted_predictions, Actual = valid_y)
+metrics_weighted <- calc_metrics(weighted_conf_matrix)
+```
+
+```{r cross_entropy}
+
+# TEST A CROSS-ENTROPY MODEL INSTEAD OF GINI
+
+# Model with cross entropy instead of Gini 
+# Train Decision Tree with Cross-Entropy
+tree_cross_entropy <- rpart(agai ~ ., 
+                            data = train_X, 
+                            method = "class", 
+                            parms = list(split = "information"),
+                            control = rpart.control(cp = 0.01))
+
+# Predict on validation data
+bi_tree_pred_cross_entropy <- predict(tree_cross_entropy, valid_X, type = "class")
+
+# Compute confusion matrix & metrics
+bi_conf_matrix_cross_entropy <- table(Predicted = bi_tree_pred_cross_entropy, Actual = valid_y)
+metrics_cross_entropy <- calc_metrics(bi_conf_matrix_cross_entropy)
+
+```
+
+```{r penalty_tree}
+
+# TEST WITH PENALTIES FOR MISCLASSIFICATION OF MINORITY CLASS 
+
+tree_w_penalty <- rpart(agai ~ ., data = train_X, method = "class",
+                    parms = list(loss = matrix(c(0, 1, 3, 0), nrow = 2)))
+
+# Predict on validation data
+bi_tree_pred_penalty <- predict(tree_w_penalty, valid_X, type = "class")
+
+# Compute confusion matrix & metrics
+bi_conf_matrix_penalty <- table(Predicted = bi_tree_pred_penalty, Actual = valid_y)
+metrics_penalty <- calc_metrics(bi_conf_matrix_penalty)
+```
+
+Among the tested models, the one with the highest F1 score was selected, as it balances precision and recall. Given the high class imbalance, overall accuracy was not a reliable metric, as a model predicting all observations as the majority class could still achieve a high accuracy.
+
+Since the goal is to predict AI aversion, model evaluation only focused on metrics relative to the positive class. A model that increases recall but decreases precision without improving the relationship between predictors and the response variable is not truly effective. Similarly, a model that improves precision at the cost of recall may fail to capture enough instances of AI aversion. Therefore, F1 score, which balances precision and recall, served as the best measure of model performance.
+
+The best performing model used bootstrap sampling that upsampled the positive class. To tune the model, cross-validation was used to find the best complexity parameter for each k-bootstrap; these values were then averaged to determine the optimal hyperparameter. Each observation was classified using a threshold that maximized the ROC-AUC. The model was then retrained at this optimal threshold and validated on the validation set.
+
+```{r metric_calculation}
+
+# FIND BEST MODEL
+
+# List all objects in the environment
+all_objects <- ls()
+
+# Filter objects that start with "metrics"
+me_objects <- all_objects[grep("^metrics", all_objects)]
+
+# Filter objects that start with "metrics"
+me_objects <- all_objects[grep("^metrics", all_objects)]
+
+# Create an empty list to store data frames
+me_list <- list()
+
+# Loop through each metrics object and store it in the list with its name
+for (obj_name in me_objects) {
+  me_list[[obj_name]] <- get(obj_name)  # Retrieve object by name
+}
+
+# Combine all into one data frame, adding a column for the object name
+combined_metrics <- do.call(rbind, lapply(names(me_list), function(name) {
+  df <- me_list[[name]]
+  df$source <- name  # Add column to track original object name
+  return(df)
+}))
+
+# Select every other row (only metrics for the positive class)
+class1_metrics <- combined_metrics[seq(2, nrow(combined_metrics), by = 2), ]
+
+# Find the row index with the highest F1 score
+best_index <- which.max(class1_metrics$F1_Score)
+
+# Extract the row with the highest F1 score
+best_model <- class1_metrics[best_index, ]
+```
+
+This model was then run on the test data to evaluate out-of-sample performance. To evaluate this, we can look at its metrics on the test data. Table 2 shows that it still has a weak performance on the positive class compared to the negative class.
+
+```{r model_perofrmance}
+
+# EVALUDATE ON TEST DATA
+
+# Run the final model on the test data
+final_predictions_test <- average_probabilities(cv_boot_models_c1up, test_X)
+final_predictions_test <- factor(ifelse(final_predictions_test >= as.numeric(best_threshold_c1up_cv), 1, 0), levels = c(0, 1))
+
+# Evaluate model performance
+final_conf_matrix_test <- table(Predicted = final_predictions_test, Actual = test_y)
+final_metrics_test <- calc_metrics(final_conf_matrix_test)
+
+# Ensure row names are included as a column
+final_metrics_test <- data.frame(Class = rownames(final_metrics_test), final_metrics_test, row.names = NULL)
+
+# Use flextable to format the table
+ft <- flextable(final_metrics_test) %>%
+  set_caption("Table 2: Model Performance Metrics on Test Data") %>%
+  theme_vanilla() %>%  # Apply a clean table style
+  autofit()  # Adjust column widths automatically
+
+# Print the table
+ft
+```
+
+Plotting this sensitivity vs. specificity on the ROC curve you can see that it predicts better than random chance, but not by much. 
+
+```{r roc_curve}
+# Convert factors to numeric (0 and 1)
+test_y_numeric <- as.numeric(as.character(test_y))  # Convert test_y to numeric
+predictions_numeric <- as.numeric(as.character(final_predictions_test))  # Convert predictions
+
+# Compute and plot ROC curve
+roc_curve <- suppressMessages(roc(test_y_numeric, predictions_numeric))
+
+# Plot ROC curve
+plot(roc_curve, col = "blue", main = "Figure 1: ROC Curve for Upsampled Bootstrapping Model")
+```
+
+To see what is happening behind the model, the first model from my 20 bootstrapped models can be visualized. 
+```{r sample_tree}
+rpart.plot(cv_boot_models_c1up[[1]], main = "Figure 2: Sample Tree from Upsampled Bootstrapping Model")
+
+# Get variable importance for each tree
+importance_list <- lapply(cv_boot_models_c1up, function(model) model$variable.importance)
+
+# Convert to a data frame and handle missing values
+importance_df <- do.call(rbind, lapply(importance_list, function(x) {
+  if (is.null(x)) return(data.frame(variable = character(), importance = numeric()))
+  data.frame(variable = names(x), importance = x)
+}))
+```
+
+However, due to the poor predictive power of the model. It can be concluded that using LASSO or Ridge Regression, KNN-clustering, and CART models created using the 2019 Oxford Internet Survey, it is infeasible to accurately predict AI averse individuals. 
+
+## Appendix: All code in this assignment
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE} 
+# this chunk generates the complete code appendix. 
+# eval=FALSE tells R not to run (``evaluate'') the code here (it was already run before).
+```
