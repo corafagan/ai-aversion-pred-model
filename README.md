@@ -68,7 +68,7 @@ The goal was to build interpretable classification models to predict AI aversion
 
 ---
 
-## 🛠Tech Stack
+## Tech Stack
 
 - **Language**: R
 - **Libraries**: `rpart`, `caret`, `pROC`, `tidyverse`, `flextable`, `rpart.plot`, `glmnet`, `haven`
